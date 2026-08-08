@@ -7,9 +7,36 @@
 #include "tt/runtime/detail/ttnn/utils.h"
 #include "ttnn/distributed/distributed_tensor.hpp"
 
+#include <algorithm>
+#include <variant>
+
 namespace tt::runtime::ttnn::operations::ccl {
 using ::ttnn::distributed::MeshMapperConfig;
 using ::ttnn::distributed::TensorToMesh;
+
+namespace {
+
+bool isFullyReplicated(const MeshMapperConfig &config) {
+  return !config.placements.empty() &&
+         std::all_of(config.placements.begin(), config.placements.end(),
+                     [](const MeshMapperConfig::Placement &placement) {
+                       return std::holds_alternative<
+                           MeshMapperConfig::Replicate>(placement);
+                     });
+}
+
+bool isAlreadyFullyReplicatedOnMesh(const ::ttnn::Tensor &input,
+                                    const ::ttnn::MeshDevice &meshDevice,
+                                    const MeshMapperConfig &config) {
+  if (!isFullyReplicated(config) || !input.is_scalar()) {
+    return false;
+  }
+
+  const auto &hostTensor = input.host_tensor();
+  return hostTensor.buffer().shape() == meshDevice.shape();
+}
+
+} // namespace
 
 void run(const ::tt::target::ttnn::DistributeTensorOp *op,
          ProgramContext &context) {
@@ -47,8 +74,11 @@ void run(const ::tt::target::ttnn::DistributeTensorOp *op,
   }
   std::unique_ptr<TensorToMesh> meshMapper =
       ::ttnn::distributed::create_mesh_mapper(meshDevice, meshMapperConfig);
-  ::ttnn::Tensor out =
-      ::ttnn::distributed::distribute_tensor(input, *meshMapper);
+  ::ttnn::Tensor out = isAlreadyFullyReplicatedOnMesh(input, meshDevice,
+                                                      meshMapperConfig)
+                           ? input
+                           : ::ttnn::distributed::distribute_tensor(input,
+                                                                    *meshMapper);
 
   tensorPool.insertTTNNTensorAndValidate(op->out(), out);
 }
