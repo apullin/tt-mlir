@@ -4,7 +4,10 @@
 
 #include "tt/runtime/detail/common/mesh_fabric_config.h"
 
+#include <map>
 #include <set>
+#include <tuple>
+#include <utility>
 
 #include "tt/runtime/detail/common/logger.h"
 #include "tt/runtime/detail/common/system_mesh.h"
@@ -13,24 +16,35 @@ namespace tt::runtime::common {
 
 namespace {
 
+using DevicePair = std::pair<uint32_t, uint32_t>;
+using DevicePairConnectionCounts = std::map<DevicePair, size_t>;
+
+DevicePair normalizeDevicePair(uint32_t id0, uint32_t id1) {
+  if (id0 > id1) {
+    std::swap(id0, id1);
+  }
+  return {id0, id1};
+}
+
 // Classify a line of devices based on their connectivity:
-//   DISABLED       — fewer than 2 devices, or any adjacent link is missing.
-//   FABRIC_1D      — all adjacent pairs connected, no wraparound.
-//   FABRIC_1D_RING — all adjacent pairs connected AND last wraps to first.
+//   DISABLED       - fewer than 2 devices, or any adjacent link is missing.
+//   FABRIC_1D      - all adjacent pairs connected, no wraparound.
+//   FABRIC_1D_RING - all adjacent pairs connected AND last wraps to first.
 //
 // If any adjacent link is broken the line cannot form even a linear topology.
-FabricConfig
-classifyLine(const std::vector<uint32_t> &line,
-             const std::set<std::pair<uint32_t, uint32_t>> &connections) {
+FabricConfig classifyLine(const std::vector<uint32_t> &line,
+                          const DevicePairConnectionCounts &connections) {
   if (line.size() < 2) {
     return FabricConfig::DISABLED;
   }
 
-  auto areConnected = [&connections](uint32_t id0, uint32_t id1) {
-    if (id0 > id1) {
-      std::swap(id0, id1);
-    }
-    return connections.count({id0, id1}) > 0;
+  auto connectionCount = [&connections](uint32_t id0, uint32_t id1) {
+    auto it = connections.find(normalizeDevicePair(id0, id1));
+    return it == connections.end() ? 0 : it->second;
+  };
+
+  auto areConnected = [&connectionCount](uint32_t id0, uint32_t id1) {
+    return connectionCount(id0, id1) > 0;
   };
 
   for (size_t i = 0; i + 1 < line.size(); ++i) {
@@ -39,6 +53,12 @@ classifyLine(const std::vector<uint32_t> &line,
                   " are not connected, disabling line.");
       return FabricConfig::DISABLED;
     }
+  }
+
+  if (line.size() == 2) {
+    return connectionCount(line.front(), line.back()) > 1
+               ? FabricConfig::FABRIC_1D_RING
+               : FabricConfig::FABRIC_1D;
   }
 
   if (!areConnected(line.front(), line.back())) {
@@ -53,9 +73,8 @@ classifyLine(const std::vector<uint32_t> &line,
 //   - Any line DISABLED  -> axis is DISABLED
 //   - Any line FABRIC_1D -> axis is at most FABRIC_1D
 //   - All lines RING     -> axis is FABRIC_1D_RING
-FabricConfig
-classifyAxis(const std::vector<std::vector<uint32_t>> &lines,
-             const std::set<std::pair<uint32_t, uint32_t>> &connections) {
+FabricConfig classifyAxis(const std::vector<std::vector<uint32_t>> &lines,
+                          const DevicePairConnectionCounts &connections) {
   bool allRing = true;
   for (const auto &line : lines) {
     FabricConfig lineConfig = classifyLine(line, connections);
@@ -89,14 +108,28 @@ MeshFabricConfig computeMeshFabricConfig(
   LOG_ASSERT(deviceIds.size() == totalDevices, "Expected ", totalDevices,
              " device IDs, got ", deviceIds.size());
 
-  std::set<std::pair<uint32_t, uint32_t>> connections;
+  std::set<
+      std::tuple<uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t>>
+      distinctChannels;
+  DevicePairConnectionCounts connections;
   for (const auto &channel : chipChannels) {
     uint32_t id0 = channel.device_id0();
     uint32_t id1 = channel.device_id1();
+    uint32_t y0 = channel.ethernet_core_coord0().y();
+    uint32_t x0 = channel.ethernet_core_coord0().x();
+    uint32_t y1 = channel.ethernet_core_coord1().y();
+    uint32_t x1 = channel.ethernet_core_coord1().x();
     if (id0 > id1) {
       std::swap(id0, id1);
+      std::swap(y0, y1);
+      std::swap(x0, x1);
+    } else if (id0 == id1 && std::tie(y0, x0) > std::tie(y1, x1)) {
+      std::swap(y0, y1);
+      std::swap(x0, x1);
     }
-    connections.insert({id0, id1});
+    if (distinctChannels.insert({id0, y0, x0, id1, y1, x1}).second) {
+      ++connections[{id0, id1}];
+    }
   }
 
   // Build row-axis and column-axis lines of devices.
